@@ -1,0 +1,20 @@
+{
+  "name": "com.psilab.splatxr",
+  "displayName": "SplatXR",
+  "version": "0.1.0",
+  "unity": "2022.3",
+  "description": "Toolkit for developing AR/VR applications with 3D Gaussian splatting. Homepage, documentation and paper: (https://splatxr.github.io). Part of the UIST '26 paper \"SplatXR: A Toolkit for Multi-Layered Extended Reality via On-Headset 3D Gaussian Splatting\". Created by Princeton's Situated Interactions Lab. Authors: Cyrus Vachha, Mohamed Kari, Parastoo Abtahi. MIT License.",
+  "documentationUrl": "https://splatxr.github.io/docs/index.html",
+  "license": "MIT",
+  "author": {
+    "name": "Princeton's Situated Interactions Lab"
+  },
+  "keywords": [
+    "gaussian splatting",
+    "neural rendering",
+    "xr",
+    "vr",
+    "ar",
+    "toolkit"
+  ]
+}
