@@ -74,6 +74,21 @@ namespace SplatXR
                 return;
             }
         
+            // Clicking the splat in the Scene view selects its splat_renderer child; the effect belongs on the parent.
+            if (targetSplat.transform.Find("splat_renderer") == null && targetSplat.transform.parent != null &&
+                targetSplat.transform.parent.GetComponent<SplatRendererBuildingBlock>() != null)
+            {
+                targetSplat = targetSplat.transform.parent.gameObject;
+            }
+
+            Transform splatRendererChild = targetSplat.transform.Find("splat_renderer");
+            MeshRenderer meshRenderer = splatRendererChild != null ? splatRendererChild.GetComponent<MeshRenderer>() : null;
+            if (meshRenderer == null || meshRenderer.sharedMaterial == null)
+            {
+                Debug.LogError($"No splat_renderer child with a splat material found on {targetSplat.name}. Select an object created by the Splat Renderer building block.");
+                return;
+            }
+
             int effectSelection = GetParameterValue(parameters, "Effect Selection", 0);
         
             var effectsComponent = targetSplat.GetComponent<SplatEffectsBuildingBlock>();
@@ -83,7 +98,7 @@ namespace SplatXR
             }
         
             Shader effectShader = GetEffectShader(effectSelection, parameters);
-            ConfigureEffectsComponent(effectsComponent, effectShader);
+            ConfigureEffectsComponent(effectsComponent, meshRenderer.sharedMaterial, effectShader);
         
             string effectName = effectSelection == CustomShaderIndex && effectShader != null ? effectShader.name : GetEffectTypeName(effectSelection);
             Debug.Log($"Added {effectName} effect to {targetSplat.name}");
@@ -91,34 +106,21 @@ namespace SplatXR
             EditorUtility.SetDirty(targetSplat);
         }
     
-        private void ConfigureEffectsComponent(SplatEffectsBuildingBlock effectsComponent, Shader effectShader)
+        private void ConfigureEffectsComponent(SplatEffectsBuildingBlock effectsComponent, Material currentMaterial, Shader effectShader)
         {
-            Transform splatRendererChild = effectsComponent.transform.Find("splat_renderer");
-            if (splatRendererChild != null)
+            Undo.RecordObject(currentMaterial, "Apply Splat Effect");
+
+            if (effectShader != null)
             {
-                MeshRenderer meshRenderer = splatRendererChild.GetComponent<MeshRenderer>();
-                if (meshRenderer != null && meshRenderer.sharedMaterial != null)
-                {
-                    Material currentMaterial = meshRenderer.sharedMaterial;
-                
-                    if (effectShader != null)
-                    {
-                        currentMaterial.shader = effectShader;
-                    }
-                
-                    effectsComponent.effectMaterial = currentMaterial;
-                    effectsComponent.isEffectActive = false;
-                    currentMaterial.SetFloat("_EffectActive", 0f);
-                }
-                else
-                {
-                    Debug.LogWarning($"splat_renderer child found but no MeshRenderer or material found on {effectsComponent.gameObject.name}");
-                }
+                // Assigning a shader resets the material's render queue to the shader's; keep the splat's own queue.
+                int renderQueue = currentMaterial.renderQueue;
+                currentMaterial.shader = effectShader;
+                currentMaterial.renderQueue = renderQueue;
             }
-            else
-            {
-                Debug.LogWarning($"No splat_renderer child object found on {effectsComponent.gameObject.name}");
-            }
+
+            effectsComponent.effectMaterial = currentMaterial;
+            effectsComponent.isEffectActive = false;
+            currentMaterial.SetFloat("_EffectActive", 0f);
         }
     
         private Shader GetEffectShader(int effectSelection, Dictionary<string, object> parameters)

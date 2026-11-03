@@ -67,6 +67,11 @@ namespace SplatXR
                 DrawLeftPanel();
                 DrawRightPanel();
             }
+            catch (ExitGUIException)
+            {
+                // Thrown on purpose by object pickers and color pickers; IMGUI must see it.
+                throw;
+            }
             catch (System.Exception ex)
             {
                 GUILayout.Label($"Error: {ex.Message}", EditorStyles.helpBox);
