@@ -1,3 +1,4 @@
+using System;
 using System.Globalization;
 using UnityEngine;
 
@@ -19,8 +20,11 @@ namespace SplatXR
 
             if (csvFile == null) return false;
 
-            string[] lines = csvFile.text.Split('\n');
-            int capacity = Mathf.Max(0, lines.Length - 1);
+            // Parse the lines as spans of the text instead of splitting it into millions of small strings.
+            string text = csvFile.text;
+            int lineCount = 1;
+            for (int i = text.IndexOf('\n'); i >= 0; i = text.IndexOf('\n', i + 1)) lineCount++;
+            int capacity = Mathf.Max(0, lineCount - 1);
 
             positions = new Vector3[capacity];
             colors = new Vector3[capacity];
@@ -33,10 +37,15 @@ namespace SplatXR
             int skipped = 0;
             int firstSkippedLine = 0;
 
-            for (int i = 1; i < lines.Length; i++)
+            int lineStart = text.IndexOf('\n') + 1;
+            for (int i = 1; i < lineCount; i++)
             {
-                string line = lines[i];
-                if (string.IsNullOrWhiteSpace(line)) continue;
+                int lineEnd = text.IndexOf('\n', lineStart);
+                if (lineEnd < 0) lineEnd = text.Length;
+                ReadOnlySpan<char> line = text.AsSpan(lineStart, lineEnd - lineStart);
+                lineStart = lineEnd + 1;
+
+                if (line.IsWhiteSpace()) continue;
 
                 if (!TryParseValues(line, values))
                 {
@@ -77,17 +86,20 @@ namespace SplatXR
             return true;
         }
 
-        private static bool TryParseValues(string line, float[] values)
+        // Reads the first ColumnCount comma-separated values; any further columns are ignored.
+        private static bool TryParseValues(ReadOnlySpan<char> line, float[] values)
         {
-            string[] parts = line.Split(',');
-            if (parts.Length < ColumnCount) return false;
-
             for (int i = 0; i < ColumnCount; i++)
             {
-                if (!float.TryParse(parts[i], NumberStyles.Float, CultureInfo.InvariantCulture, out values[i]))
+                int comma = line.IndexOf(',');
+                if (comma < 0 && i < ColumnCount - 1) return false;
+
+                ReadOnlySpan<char> field = comma < 0 ? line : line.Slice(0, comma);
+                if (!float.TryParse(field, NumberStyles.Float, CultureInfo.InvariantCulture, out values[i]))
                 {
                     return false;
                 }
+                line = comma < 0 ? ReadOnlySpan<char>.Empty : line.Slice(comma + 1);
             }
             return true;
         }
