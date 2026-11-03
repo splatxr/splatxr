@@ -77,7 +77,7 @@ def get_mesh_output_path(splat_path, mesh_output_dir) -> Path:
 
 
 def load_splats(path):
-    """Return (pos, opacity, scale, rot) as float32 arrays; rot is (w, x, y, z)."""
+    """Return (pos, opacity, scale, rot) as float32 arrays; rot is a unit (w, x, y, z) quaternion."""
     vertices = read_ply_vertices(path)
     n = len(vertices["x"])
 
@@ -93,22 +93,35 @@ def load_splats(path):
     rot = cols(("rot_0", "rot_1", "rot_2", "rot_3"), 0.0)
     if "rot_3" not in vertices:
         rot[:, 0] = 1.0
-    return pos, opacity, scale, rot
+    return pos, opacity, scale, normalize_quats(rot)
+
+
+def normalize_quats(rot: np.ndarray) -> np.ndarray:
+    """3DGS PLYs store raw, unnormalized quaternions; normalize them (zero quaternions become identity)."""
+    norm = np.linalg.norm(rot.astype(np.float64), axis=1, keepdims=True)
+    identity = np.array([1.0, 0.0, 0.0, 0.0])
+    unit = np.where(norm > 0.0, rot / np.where(norm > 0.0, norm, 1.0), identity)
+    return unit.astype(np.float32)
 
 
 def quat_wxyz_to_matrix(q: np.ndarray) -> np.ndarray:
-    w, x, y, z = [float(v) for v in q]
+    """Rotation matrices for unit (w, x, y, z) quaternions of shape (..., 4); returns shape (..., 3, 3)."""
+    q = np.asarray(q, dtype=np.float64)
+    w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
     xx, yy, zz = x * x, y * y, z * z
     xy, xz, yz = x * y, x * z, y * z
     xw, yw, zw = x * w, y * w, z * w
-    return np.array(
-        [
-            [1.0 - 2.0 * (yy + zz), 2.0 * (xy - zw), 2.0 * (xz + yw)],
-            [2.0 * (xy + zw), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - xw)],
-            [2.0 * (xz - yw), 2.0 * (yz + xw), 1.0 - 2.0 * (xx + yy)],
-        ],
-        dtype=np.float32,
-    )
+    m = np.empty(q.shape[:-1] + (3, 3), dtype=np.float32)
+    m[..., 0, 0] = 1.0 - 2.0 * (yy + zz)
+    m[..., 0, 1] = 2.0 * (xy - zw)
+    m[..., 0, 2] = 2.0 * (xz + yw)
+    m[..., 1, 0] = 2.0 * (xy + zw)
+    m[..., 1, 1] = 1.0 - 2.0 * (xx + zz)
+    m[..., 1, 2] = 2.0 * (yz - xw)
+    m[..., 2, 0] = 2.0 * (xz - yw)
+    m[..., 2, 1] = 2.0 * (yz + xw)
+    m[..., 2, 2] = 1.0 - 2.0 * (xx + yy)
+    return m
 
 
 def splat_func(d2: np.ndarray) -> np.ndarray:
@@ -119,18 +132,22 @@ def splat_func(d2: np.ndarray) -> np.ndarray:
     return out
 
 
-def build_field(pos, opacity, scale, rot, thresh: float, splat_scale: float, grid_size: int):
-    """Rasterize splats into a grid; the surface is the field's zero level set."""
-    splat_support = 2.0
-    n = pos.shape[0]
+def build_field(pos, opacity, scale, rot, thresh: float, splat_scale: float, grid_size: int,
+                max_batch_voxels: int = 1 << 21):
+    """Rasterize splats into a grid; the surface is the field's zero level set.
 
-    bmin = np.full(3, np.inf, dtype=np.float32)
-    bmax = np.full(3, -np.inf, dtype=np.float32)
-    for i in range(n):
-        a = quat_wxyz_to_matrix(rot[i]) @ np.diag(splat_scale * scale[i])
-        extent = splat_support * np.sqrt(np.sum(a * a, axis=1))
-        bmin = np.minimum(bmin, pos[i] - extent)
-        bmax = np.maximum(bmax, pos[i] + extent)
+    Splats are rasterized in vectorized batches of splats that share the same voxel footprint;
+    max_batch_voxels bounds the temporary memory of one batch.
+    """
+    splat_support = 2.0
+    if pos.shape[0] == 0:
+        raise ValueError("The splat PLY contains no splats.")
+
+    rotations = quat_wxyz_to_matrix(rot)
+    a = rotations * (splat_scale * scale)[:, None, :]
+    extent = splat_support * np.sqrt(np.sum(a * a, axis=2))
+    bmin = np.min(pos - extent, axis=0)
+    bmax = np.max(pos + extent, axis=0)
 
     bbox_size = bmax - bmin
     bbox_center = 0.5 * (bmax + bmin)
@@ -148,34 +165,58 @@ def build_field(pos, opacity, scale, rot, thresh: float, splat_scale: float, gri
 
     field = np.full((nk, nj, ni), float(thresh), dtype=np.float32)
     inv_grid_scale = 1.0 / grid_scale
-    dims = (ni, nj, nk)
+    dims = np.array([ni, nj, nk])
 
-    for i in range(n):
-        sc = np.maximum(scale[i], grid_scale) * splat_scale
-        a = quat_wxyz_to_matrix(rot[i]) @ np.diag(sc)
-        extent = splat_support * np.sqrt(np.sum(a * a, axis=1))
+    sc = np.maximum(scale, grid_scale) * splat_scale
+    a = rotations * sc[:, None, :]
+    extent = splat_support * np.sqrt(np.sum(a * a, axis=2))
+    inv_a = np.linalg.inv(a)
 
-        lo = pos[i] - extent
-        hi = pos[i] + extent
-        start = [max(int(math.floor((float(lo[d]) - float(offset[d])) * inv_grid_scale)), 0) for d in range(3)]
-        end = [min(int(math.ceil((float(hi[d]) - float(offset[d])) * inv_grid_scale)), dims[d] - 1) for d in range(3)]
-        if any(s > e for s, e in zip(start, end)):
-            continue
+    offset64 = offset.astype(np.float64)
+    start = np.maximum(np.floor(((pos - extent).astype(np.float64) - offset64) * inv_grid_scale).astype(np.int64), 0)
+    end = np.minimum(np.ceil(((pos + extent).astype(np.float64) - offset64) * inv_grid_scale).astype(np.int64), dims - 1)
+    footprint = end - start + 1
+    inside = np.flatnonzero(np.all(footprint > 0, axis=1))
+    if inside.size == 0:
+        return field, grid_scale, offset
 
-        ii, jj, kk = (np.arange(start[d], end[d] + 1, dtype=np.float32) for d in range(3))
-        kgrid, jgrid, igrid = np.meshgrid(kk, jj, ii, indexing="ij")
-        rel = np.stack(
-            (
-                offset[0] + grid_scale * igrid - pos[i, 0],
-                offset[1] + grid_scale * jgrid - pos[i, 1],
-                offset[2] + grid_scale * kgrid - pos[i, 2],
-            ),
-            axis=-1,
-        )
+    shapes, shape_of = np.unique(footprint[inside], axis=0, return_inverse=True)
+    shape_of = shape_of.reshape(-1)
+    by_shape = inside[np.argsort(shape_of, kind="stable")]
+    group_starts = np.searchsorted(np.sort(shape_of, kind="stable"), np.arange(len(shapes) + 1))
 
-        local = rel @ np.linalg.inv(a).T
-        d2 = np.sum(local * local, axis=-1, dtype=np.float32)
-        field[start[2]:end[2] + 1, start[1]:end[1] + 1, start[0]:end[0] + 1] -= opacity[i] * splat_func(d2)
+    field_flat = field.reshape(-1)
+    for g, (bx, by, bz) in enumerate(shapes):
+        members = by_shape[group_starts[g]:group_starts[g + 1]]
+        batch = max(1, max_batch_voxels // int(bx * by * bz))
+        for b in range(0, len(members), batch):
+            idx = members[b:b + batch]
+            ii = start[idx, 0:1] + np.arange(bx)
+            jj = start[idx, 1:2] + np.arange(by)
+            kk = start[idx, 2:3] + np.arange(bz)
+            rel = (
+                offset[0] + grid_scale * ii.astype(np.float32) - pos[idx, 0:1],
+                offset[1] + grid_scale * jj.astype(np.float32) - pos[idx, 1:2],
+                offset[2] + grid_scale * kk.astype(np.float32) - pos[idx, 2:3],
+            )
+
+            # local = inv(a) @ rel, evaluated on the separable (k, j, i) box of each splat.
+            d2 = np.zeros((len(idx), bz, by, bx), dtype=np.float32)
+            local = np.empty_like(d2)
+            for c in range(3):
+                np.add(
+                    (inv_a[idx, c, 0, None] * rel[0])[:, None, None, :]
+                    + (inv_a[idx, c, 1, None] * rel[1])[:, None, :, None],
+                    (inv_a[idx, c, 2, None] * rel[2])[:, :, None, None],
+                    out=local,
+                )
+                np.multiply(local, local, out=local)
+                d2 += local
+
+            hit = d2 < 4.0
+            weight = splat_func(d2[hit]) * np.broadcast_to(opacity[idx, None, None, None], d2.shape)[hit]
+            voxel = (kk[:, :, None, None] * nj + jj[:, None, :, None]) * ni + ii[:, None, None, :]
+            np.add.at(field_flat, voxel[hit], -weight)
 
     return field, grid_scale, offset
 
