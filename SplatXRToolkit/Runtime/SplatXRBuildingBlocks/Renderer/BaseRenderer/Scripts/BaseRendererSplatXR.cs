@@ -42,16 +42,34 @@ namespace SplatXR
         private bool enableEditorRendering = true;
 
 
-        private System.Threading.Tasks.Task<(int index, float dist)[]> sortingTask;
-        private System.Threading.Tasks.Task<(Vector3[] vertices, Vector3[] centerPositions, Vector3[] vertexColors, 
-            Vector4[] vertexOpacities, Vector3[] vertexCov0_3, Vector3[] vertexCov3_6, int[] indices)> meshArraysTask;
+        private System.Threading.Tasks.Task<MeshUpdate> sortingTask;
         [System.NonSerialized] private bool isSorting = false;
-        [System.NonSerialized] private bool isCreatingMeshArrays = false;
-        private Vector3[] sortedPositions;
 
-        private System.Threading.Tasks.Task meshSetTask;
-        [System.NonSerialized] private bool isSettingMesh = false;
-        private Mesh tempMesh;
+        // The splats currently in the mesh's vertex buffer ("slots") and the reusable sort buffers.
+        [System.NonSerialized] private Vector3[] meshSourcePositions;
+        [System.NonSerialized] private SplatCropBox meshCrop;
+        [System.NonSerialized] private Vector3[] slotCenters;
+        [System.NonSerialized] private int slotCount;
+        [System.NonSerialized] private Bounds slotBounds;
+        [System.NonSerialized] private float[] sortKeys;
+        [System.NonSerialized] private int[] sortSlots;
+        [System.NonSerialized] private int[] sortIndices;
+
+        private static readonly int ScaleFactorId = Shader.PropertyToID("_ScaleFactor");
+
+        // Result of a background mesh update. vertices is null when the vertex buffer didn't need rebuilding.
+        private sealed class MeshUpdate
+        {
+            public Vector3[] sourcePositions;
+            public SplatCropBox crop;
+            public SplatQuads.Vertex[] vertices;
+            public Vector3[] slotCenters;
+            public int slotCount;
+            public Bounds slotBounds;
+            public float[] sortKeys;
+            public int[] sortSlots;
+            public int[] sortIndices;
+        }
 
         [SerializeField] private bool enableCropping = false;
         [SerializeField] private Vector3 cropBoundsMin = new Vector3(-5f, -5f, -5f);
@@ -125,11 +143,9 @@ namespace SplatXR
     #endif
         public void Start()
         {
-            mesh = new Mesh();
-            mesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
-            mesh.hideFlags = HideFlags.DontSaveInEditor | HideFlags.DontSaveInBuild;
-            mesh.MarkDynamic();
+            mesh = SplatQuads.CreateMesh();
             GetComponent<MeshFilter>().mesh = mesh;
+            meshSourcePositions = null;
 
 
             var meshRenderer = GetComponent<MeshRenderer>();
@@ -137,12 +153,6 @@ namespace SplatXR
             meshRenderer.forceRenderingOff = false;
             meshRenderer.allowOcclusionWhenDynamic = false;
             meshRenderer.bounds = new Bounds(Vector3.zero, Vector3.one * 10000f);
-
-
-            tempMesh = new Mesh();
-            tempMesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
-            tempMesh.hideFlags = HideFlags.DontSaveInEditor | HideFlags.DontSaveInBuild;
-            tempMesh.MarkDynamic();
 
             LoadFromCSV();
             lastCsvFile = splatFilePath;
@@ -215,7 +225,7 @@ namespace SplatXR
             {
                 LoadFromCSV();
                 lastCsvFile = splatFilePath;
-                if (!isSorting && !isCreatingMeshArrays && !isSettingMesh)
+                if (!isSorting)
                 {
     #if UNITY_EDITOR
                     if (!EditorApplication.isPlaying && !enableEditorRendering)
@@ -235,7 +245,7 @@ namespace SplatXR
                 lastCropBoundsMax = cropBoundsMax;
                 lastCropBoundsRotation = cropBoundsRotation;
             
-                if (!isSorting && !isCreatingMeshArrays && !isSettingMesh)
+                if (!isSorting)
                 {
     #if UNITY_EDITOR
                     if (!EditorApplication.isPlaying && !enableEditorRendering)
@@ -246,9 +256,14 @@ namespace SplatXR
                     UpdateMesh();
                     lastSortTime = Time.time;
                 }
+                else
+                {
+                    // Rebuild with the new bounds as soon as the running update finishes.
+                    lastSortTime = float.NegativeInfinity;
+                }
             }
 
-            if (Time.time - lastSortTime >= sortingRate && !isSorting && !isCreatingMeshArrays && !isSettingMesh)
+            if (Time.time - lastSortTime >= sortingRate && !isSorting)
             {
     #if UNITY_EDITOR
                 if (!EditorApplication.isPlaying && !enableEditorRendering)
@@ -259,9 +274,7 @@ namespace SplatXR
                 UpdateMesh();
                 lastSortTime = Time.time;
             }
-            else if ((isSorting && sortingTask?.IsCompleted == true) ||
-                     (isCreatingMeshArrays && meshArraysTask?.IsCompleted == true) ||
-                     (isSettingMesh && meshSetTask?.IsCompleted == true))
+            else if (isSorting && sortingTask?.IsCompleted == true)
             {
     #if UNITY_EDITOR
                 if (!EditorApplication.isPlaying && !enableEditorRendering)
@@ -297,7 +310,7 @@ namespace SplatXR
     
         private void UpdateMesh()
         {
-            if (positions == null) return;
+            if (positions == null || mesh == null) return;
 
     #if UNITY_EDITOR
             if (!EditorApplication.isPlaying && !enableEditorRendering)
@@ -310,112 +323,145 @@ namespace SplatXR
             }
     #endif
 
-            var cameraPos = GetCurrentCameraPosition();
-            var worldMatrix = transform.localToWorldMatrix;
-        
+            if (!isSorting)
+            {
+                StartMeshUpdate();
+                return;
+            }
+
+            if (sortingTask?.IsCompleted != true) return;
+
+            isSorting = false;
+            if (LogIfFailed(sortingTask, "sorting")) return;
+
+            var update = sortingTask.Result;
+            if (update.sourcePositions != positions)
+            {
+                lastSortTime = float.NegativeInfinity;
+                return;
+            }
+
+            ApplyMeshUpdate(update);
+        }
+
+        // Snapshots the inputs on the main thread, then sorts on a background thread (first rebuilding the vertex
+        // data if the splats or the crop bounds changed). Unity's Mesh API is only used in ApplyMeshUpdate.
+        private void StartMeshUpdate()
+        {
             var currentPositions = positions;
             var currentColors = colors;
             var currentOpacities = opacities;
             var currentCovariances0_3 = covariances0_3;
             var currentCovariances3_6 = covariances3_6;
-        
-            var currentEnableCropping = enableCropping;
-            var currentCropBoundsMin = cropBoundsMin;
-            var currentCropBoundsMax = cropBoundsMax;
-            var currentCropBoundsRotation = cropBoundsRotation;
-        
-            if (!isSorting && !isCreatingMeshArrays && !isSettingMesh)
+
+            var crop = new SplatCropBox(enableCropping, cropBoundsMin, cropBoundsMax, cropBoundsRotation);
+            bool rebuildVertices = meshSourcePositions != currentPositions ||
+                                   !crop.SelectsSameAs(meshCrop) ||
+                                   mesh.vertexCount != slotCount * 4;
+
+            var currentSlotCenters = slotCenters;
+            var currentSlotCount = slotCount;
+            var currentSlotBounds = slotBounds;
+            var keys = sortKeys;
+            var slots = sortSlots;
+            var indices = sortIndices;
+
+            var cameraPos = GetCurrentCameraPosition();
+            var worldMatrix = GetSortMatrix();
+
+            isSorting = true;
+            sortingTask = System.Threading.Tasks.Task.Run(() =>
             {
-                isSorting = true;
-                sortedPositions = currentPositions;
-                sortingTask = System.Threading.Tasks.Task.Run(() =>
+                var update = new MeshUpdate { sourcePositions = currentPositions, crop = crop };
+
+                if (rebuildVertices)
                 {
-                    var sortingArray = new (int index, float dist)[currentPositions.Length];
-
-                    for (int i = 0; i < currentPositions.Length; i++)
-                    {
-                        Vector3 flippedPos = currentPositions[i];
-                        flippedPos.x = -flippedPos.x;
-                        Vector3 worldPos = worldMatrix.MultiplyPoint3x4(flippedPos);
-                        float distSqr = (worldPos - cameraPos).sqrMagnitude;
-                        sortingArray[i] = (i, distSqr);
-                    }
-
-                    System.Array.Sort(sortingArray, (a, b) => b.dist.CompareTo(a.dist));
-                    return sortingArray;
-                });
-                return;
-            }
-
-            if (isSorting && sortingTask?.IsCompleted == true && !isCreatingMeshArrays)
-            {
-                isSorting = false;
-                if (LogIfFailed(sortingTask, "sorting")) return;
-
-                if (sortedPositions != currentPositions)
-                {
-                    lastSortTime = float.NegativeInfinity;
-                    return;
-                }
-
-                var sortingArray = sortingTask.Result;
-                isCreatingMeshArrays = true;
-
-                meshArraysTask = System.Threading.Tasks.Task.Run(() => CreateMeshArrays(sortingArray, currentPositions, currentColors, currentOpacities, currentCovariances0_3, currentCovariances3_6, currentEnableCropping, currentCropBoundsMin, currentCropBoundsMax, currentCropBoundsRotation));
-                return;
-            }
-
-            if (isCreatingMeshArrays && meshArraysTask?.IsCompleted == true && !isSettingMesh)
-            {
-                isCreatingMeshArrays = false;
-                if (LogIfFailed(meshArraysTask, "mesh building")) return;
-
-                var meshArrays = meshArraysTask.Result;
-
-                bool isQuestPlatform = Application.platform == RuntimePlatform.Android && !Application.isEditor;
-
-                if (isQuestPlatform)
-                {
-                    isSettingMesh = true;
-                    meshSetTask = System.Threading.Tasks.Task.Run(() =>
-                    {
-                        tempMesh.Clear();
-                        tempMesh.vertices = meshArrays.vertices;
-                        tempMesh.SetUVs(1, meshArrays.centerPositions);
-                        tempMesh.SetUVs(2, meshArrays.vertexColors);
-                        tempMesh.SetUVs(3, meshArrays.vertexOpacities);
-                        tempMesh.SetUVs(5, meshArrays.vertexCov0_3);
-                        tempMesh.SetUVs(6, meshArrays.vertexCov3_6);
-                        tempMesh.SetIndices(meshArrays.indices, MeshTopology.Triangles, 0);
-                        tempMesh.RecalculateBounds();
-                    });
+                    BuildSlots(update, currentPositions, currentColors, currentOpacities, currentCovariances0_3, currentCovariances3_6, crop);
                 }
                 else
                 {
-                    mesh.Clear();
-                    mesh.vertices = meshArrays.vertices;
-                    mesh.SetUVs(1, meshArrays.centerPositions);
-                    mesh.SetUVs(2, meshArrays.vertexColors);
-                    mesh.SetUVs(3, meshArrays.vertexOpacities);
-                    mesh.SetUVs(5, meshArrays.vertexCov0_3);
-                    mesh.SetUVs(6, meshArrays.vertexCov3_6);
-                    mesh.SetIndices(meshArrays.indices, MeshTopology.Triangles, 0);
-                    mesh.RecalculateBounds();
+                    update.slotCenters = currentSlotCenters;
+                    update.slotCount = currentSlotCount;
+                    update.slotBounds = currentSlotBounds;
                 }
-                return;
-            }
 
-            bool isQuestDevice = Application.platform == RuntimePlatform.Android && !Application.isEditor;
-            if (isQuestDevice && isSettingMesh && meshSetTask?.IsCompleted == true)
+                int count = update.slotCount;
+                if (keys == null || keys.Length < count)
+                {
+                    keys = new float[count];
+                    slots = new int[count];
+                    indices = new int[count * 6];
+                }
+
+                var centers = update.slotCenters;
+                for (int i = 0; i < count; i++)
+                {
+                    keys[i] = -(worldMatrix.MultiplyPoint3x4(centers[i]) - cameraPos).sqrMagnitude;
+                    slots[i] = i;
+                }
+                SplatQuads.SortAndWriteIndices(keys, slots, count, indices);
+
+                update.sortKeys = keys;
+                update.sortSlots = slots;
+                update.sortIndices = indices;
+                return update;
+            });
+        }
+
+        private static void BuildSlots(MeshUpdate update, Vector3[] positionsArray, Vector3[] colorsArray, float[] opacitiesArray,
+                                       Vector3[] covariances0_3Array, Vector3[] covariances3_6Array, SplatCropBox crop)
+        {
+            var inside = new int[positionsArray.Length];
+            int count = 0;
+            for (int i = 0; i < positionsArray.Length; i++)
             {
-                isSettingMesh = false;
-                if (LogIfFailed(meshSetTask, "mesh upload")) return;
-
-                var temp = mesh;
-                mesh = tempMesh;
-                tempMesh = temp;
-                GetComponent<MeshFilter>().mesh = mesh;
+                Vector3 splatPosition = positionsArray[i];
+                splatPosition.x = -splatPosition.x;
+                if (crop.Contains(splatPosition))
+                {
+                    inside[count++] = i;
+                }
             }
+
+            var vertices = new SplatQuads.Vertex[count * 4];
+            var centers = new Vector3[count];
+            for (int slot = 0; slot < count; slot++)
+            {
+                int i = inside[slot];
+                centers[slot] = SplatQuads.WriteSlot(vertices, slot, positionsArray[i], colorsArray[i], opacitiesArray[i],
+                                                     covariances0_3Array[i], covariances3_6Array[i]);
+            }
+
+            update.vertices = vertices;
+            update.slotCenters = centers;
+            update.slotCount = count;
+            update.slotBounds = SplatQuads.ComputeBounds(centers, count);
+        }
+
+        private void ApplyMeshUpdate(MeshUpdate update)
+        {
+            if (update.vertices != null)
+            {
+                SplatQuads.UploadVertices(mesh, update.vertices, update.slotCount);
+                meshSourcePositions = update.sourcePositions;
+                meshCrop = update.crop;
+                slotCenters = update.slotCenters;
+                slotCount = update.slotCount;
+                slotBounds = update.slotBounds;
+            }
+
+            sortKeys = update.sortKeys;
+            sortSlots = update.sortSlots;
+            sortIndices = update.sortIndices;
+            SplatQuads.UploadIndices(mesh, sortIndices, slotCount, slotBounds);
+        }
+
+        // The splat shaders scale centers by _ScaleFactor in object space, so sort in that space too.
+        private Matrix4x4 GetSortMatrix()
+        {
+            Material splatMaterial = GetComponent<MeshRenderer>().sharedMaterial;
+            float scaleFactor = splatMaterial != null && splatMaterial.HasProperty(ScaleFactorId) ? splatMaterial.GetFloat(ScaleFactorId) : 1f;
+            return transform.localToWorldMatrix * Matrix4x4.Scale(new Vector3(scaleFactor, scaleFactor, scaleFactor));
         }
 
         private bool LogIfFailed(System.Threading.Tasks.Task task, string stage)
@@ -425,141 +471,31 @@ namespace SplatXR
             return true;
         }
 
-        private bool IsPositionWithinCropBounds(Vector3 position)
-        {
-            return IsPositionWithinCropBounds(position, enableCropping, cropBoundsMin, cropBoundsMax, cropBoundsRotation);
-        }
-    
-        private bool IsPositionWithinCropBounds(Vector3 position, bool enableCroppingParam, Vector3 cropBoundsMinParam, Vector3 cropBoundsMaxParam, Vector3 cropBoundsRotationParam)
-        {
-            if (!enableCroppingParam) return true;
-        
-            Vector3 cropCenter = (cropBoundsMinParam + cropBoundsMaxParam) * 0.5f;
-            Vector3 cropSize = cropBoundsMaxParam - cropBoundsMinParam;
-        
-            Vector3 localPosition = position - cropCenter;
-        
-            if (cropBoundsRotationParam != Vector3.zero)
-            {
-                Quaternion inverseRotation = Quaternion.Inverse(Quaternion.Euler(cropBoundsRotationParam));
-                localPosition = inverseRotation * localPosition;
-            }
-        
-            return Mathf.Abs(localPosition.x) <= cropSize.x * 0.5f &&
-                   Mathf.Abs(localPosition.y) <= cropSize.y * 0.5f &&
-                   Mathf.Abs(localPosition.z) <= cropSize.z * 0.5f;
-        }
-
-        private (Vector3[] vertices, Vector3[] centerPositions, Vector3[] vertexColors, 
-                 Vector4[] vertexOpacities, Vector3[] vertexCov0_3, Vector3[] vertexCov3_6, 
-                 int[] indices) 
-            CreateMeshArrays((int index, float dist)[] sortingArray, Vector3[] positionsArray, Vector3[] colorsArray, 
-                            float[] opacitiesArray, Vector3[] covariances0_3Array, Vector3[] covariances3_6Array,
-                            bool enableCroppingParam, Vector3 cropBoundsMinParam, Vector3 cropBoundsMaxParam, Vector3 cropBoundsRotationParam)
-        {
-            int validSplatCount = 0;
-            for (int i = 0; i < sortingArray.Length; i++)
-            {
-                Vector3 splatPosition = positionsArray[sortingArray[i].index];
-                splatPosition.x = -splatPosition.x;
-                if (IsPositionWithinCropBounds(splatPosition, enableCroppingParam, cropBoundsMinParam, cropBoundsMaxParam, cropBoundsRotationParam))
-                {
-                    validSplatCount++;
-                }
-            }
-
-            int vertexCount = validSplatCount * 4;
-            Vector3[] vertices = new Vector3[vertexCount];
-            Vector3[] centerPositions = new Vector3[vertexCount];
-            Vector3[] vertexColors = new Vector3[vertexCount];
-            Vector4[] vertexOpacities = new Vector4[vertexCount];
-            Vector3[] vertexCov0_3 = new Vector3[vertexCount];
-            Vector3[] vertexCov3_6 = new Vector3[vertexCount];
-
-            int validIndex = 0;
-            for (int i = 0; i < sortingArray.Length; i++)
-            {
-                Vector3 splatPosition = positionsArray[sortingArray[i].index];
-                splatPosition.x = -splatPosition.x;
-                if (!IsPositionWithinCropBounds(splatPosition, enableCroppingParam, cropBoundsMinParam, cropBoundsMaxParam, cropBoundsRotationParam))
-                    continue;
-
-                int baseIndex = validIndex * 4;
-            
-                vertices[baseIndex + 0] = new Vector3(-1, -1, 0);
-                vertices[baseIndex + 1] = new Vector3( 1, -1, 0);
-                vertices[baseIndex + 2] = new Vector3(-1,  1, 0);
-                vertices[baseIndex + 3] = new Vector3( 1,  1, 0);
-
-                Vector3 flippedPosition = positionsArray[sortingArray[i].index];
-                flippedPosition.x = -flippedPosition.x;
-            
-                Vector3 flippedCov0_3 = covariances0_3Array[sortingArray[i].index];
-                Vector3 flippedCov3_6 = covariances3_6Array[sortingArray[i].index];
-                flippedCov0_3.y = -flippedCov0_3.y;
-                flippedCov0_3.z = -flippedCov0_3.z;
-            
-                for (int j = 0; j < 4; j++)
-                {
-                    centerPositions[baseIndex + j] = flippedPosition;
-                    vertexColors[baseIndex + j] = colorsArray[sortingArray[i].index];
-                    vertexOpacities[baseIndex + j] = new Vector4(opacitiesArray[sortingArray[i].index], 0, 0, 0);
-                    vertexCov0_3[baseIndex + j] = flippedCov0_3;
-                    vertexCov3_6[baseIndex + j] = flippedCov3_6;
-                }
-                validIndex++;
-            }
-
-            int[] indices = new int[validSplatCount * 6];
-            for (int i = 0; i < validSplatCount; i++)
-            {
-                int baseIndex = i * 6;
-                int baseVertex = i * 4;
-            
-                indices[baseIndex + 0] = baseVertex + 0;
-                indices[baseIndex + 1] = baseVertex + 2;
-                indices[baseIndex + 2] = baseVertex + 1;
-            
-                indices[baseIndex + 3] = baseVertex + 2;
-                indices[baseIndex + 4] = baseVertex + 3;
-                indices[baseIndex + 5] = baseVertex + 1;
-            }
-
-            return (vertices, centerPositions, vertexColors, vertexOpacities, vertexCov0_3, vertexCov3_6, indices);
-        }
-
         private void OnDestroy()
         {
-            if ((isSorting && sortingTask != null) || 
-                (isCreatingMeshArrays && meshArraysTask != null) || 
-                (isSettingMesh && meshSetTask != null))
+            if (isSorting && sortingTask != null)
             {
                 try
                 {
-                    sortingTask?.Wait();
-                    meshArraysTask?.Wait();
-                    meshSetTask?.Wait();
+                    sortingTask.Wait();
                 }
                 catch (System.Exception e)
                 {
                     Debug.LogError($"Error waiting for background tasks to complete: {e}");
                 }
             }
-        
+
     #if UNITY_EDITOR
             if (!UnityEditor.EditorApplication.isPlaying)
             {
                 if (mesh != null) DestroyImmediate(mesh);
-                if (tempMesh != null) DestroyImmediate(tempMesh);
             }
             else
             {
                 if (mesh != null) Destroy(mesh);
-                if (tempMesh != null) Destroy(tempMesh);
             }
     #else
             if (mesh != null) Destroy(mesh);
-            if (tempMesh != null) Destroy(tempMesh);
     #endif
         }
 
@@ -641,13 +577,14 @@ namespace SplatXR
             if (positions == null) return 0;
         
             if (!enableCropping) return positions.Length;
-        
+
+            var crop = new SplatCropBox(enableCropping, cropBoundsMin, cropBoundsMax, cropBoundsRotation);
             int count = 0;
             for (int i = 0; i < positions.Length; i++)
             {
                 Vector3 pos = positions[i];
                 pos.x = -pos.x;
-                if (IsPositionWithinCropBounds(pos))
+                if (crop.Contains(pos))
                     count++;
             }
             return count;
