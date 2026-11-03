@@ -8,7 +8,12 @@ namespace SplatXR
     {
         public override void OnGUI(Rect position, MaterialProperty prop, GUIContent label, MaterialEditor editor)
         {
+            // MaterialProperty.propertyType only exists from Unity 6.3; older versions (down to 2022.3) only have type.
+    #if UNITY_6000_3_OR_NEWER
             if (prop.propertyType != UnityEngine.Rendering.ShaderPropertyType.Vector)
+    #else
+            if (prop.type != MaterialProperty.PropType.Vector)
+    #endif
             {
                 editor.DefaultShaderProperty(position, prop, label.text);
                 return;

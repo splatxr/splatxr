@@ -22,6 +22,9 @@ namespace SplatXR
         [Tooltip("Whether to loop the effect")]
         public bool loopEffect = false;
 
+        private static readonly int EffectActiveId = Shader.PropertyToID("_EffectActive");
+        private static readonly int EffectTimeId = Shader.PropertyToID("_EffectTime");
+
         public float EffectTime => effectTime;
 
         public bool IsActive => isEffectActive;
@@ -78,8 +81,8 @@ namespace SplatXR
         {
             if (effectMaterial == null) return;
 
-            effectMaterial.SetFloat("_EffectActive", isEffectActive ? 1f : 0f);
-            effectMaterial.SetFloat("_EffectTime", effectTime);
+            effectMaterial.SetFloat(EffectActiveId, isEffectActive ? 1f : 0f);
+            effectMaterial.SetFloat(EffectTimeId, effectTime);
         }
 
 

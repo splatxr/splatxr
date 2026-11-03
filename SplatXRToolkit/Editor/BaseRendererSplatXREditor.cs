@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEngine;
 using UnityEditor;
 using System.Reflection;
@@ -7,57 +8,58 @@ namespace SplatXR
     [InitializeOnLoad]
     public static class BaseRendererSplatXROutlineDisabler
     {
-        private static bool? savedOutlineState = null;
-        private static bool wasShowingOutlineForSplatXR = false;
+        // Kept in EditorPrefs rather than a static field so the user's outline setting is still restored after a
+        // domain reload or editor restart that happens while a splat is selected.
+        private const string SavedOutlineStateKey = "SplatXR.SavedSelectionOutline";
+
+        private static MeshRenderer[] selectedSplatRenderers = new MeshRenderer[0];
 
         static BaseRendererSplatXROutlineDisabler()
         {
             SceneView.duringSceneGui += OnSceneGUI;
             Selection.selectionChanged += OnSelectionChanged;
+            EditorApplication.delayCall += OnSelectionChanged;
         }
 
         private static void OnSelectionChanged()
         {
-            bool isSplatXRSelected = false;
-        
+            // Selecting the Splat Renderer parent outlines its splat_renderer child too, so look at children.
+            var renderers = new List<MeshRenderer>();
             foreach (var obj in Selection.gameObjects)
             {
-                if (obj.GetComponent<BaseRendererSplatXR>() != null)
+                foreach (var splat in obj.GetComponentsInChildren<BaseRendererSplatXR>(true))
                 {
-                    isSplatXRSelected = true;
-                    break;
+                    renderers.Add(splat.GetComponent<MeshRenderer>());
+                }
+                foreach (var splat in obj.GetComponentsInChildren<LoDRendererSplatXR>(true))
+                {
+                    renderers.Add(splat.GetComponent<MeshRenderer>());
                 }
             }
+            selectedSplatRenderers = renderers.ToArray();
 
-            if (isSplatXRSelected && !wasShowingOutlineForSplatXR)
+            bool isSplatXRSelected = selectedSplatRenderers.Length > 0;
+            bool outlineDisabledForSplatXR = EditorPrefs.HasKey(SavedOutlineStateKey);
+
+            if (isSplatXRSelected && !outlineDisabledForSplatXR)
             {
-                savedOutlineState = GetSelectionOutlineState();
+                EditorPrefs.SetBool(SavedOutlineStateKey, GetSelectionOutlineState());
                 SetSelectionOutlineState(false);
-                wasShowingOutlineForSplatXR = true;
             }
-            else if (!isSplatXRSelected && wasShowingOutlineForSplatXR)
+            else if (!isSplatXRSelected && outlineDisabledForSplatXR)
             {
-                if (savedOutlineState.HasValue)
-                {
-                    SetSelectionOutlineState(savedOutlineState.Value);
-                    savedOutlineState = null;
-                }
-                wasShowingOutlineForSplatXR = false;
+                SetSelectionOutlineState(EditorPrefs.GetBool(SavedOutlineStateKey, true));
+                EditorPrefs.DeleteKey(SavedOutlineStateKey);
             }
         }
 
         private static void OnSceneGUI(SceneView sceneView)
         {
-            foreach (var obj in Selection.gameObjects)
+            foreach (MeshRenderer meshRenderer in selectedSplatRenderers)
             {
-                BaseRendererSplatXR renderer = obj.GetComponent<BaseRendererSplatXR>();
-                if (renderer != null)
+                if (meshRenderer != null)
                 {
-                    MeshRenderer meshRenderer = renderer.GetComponent<MeshRenderer>();
-                    if (meshRenderer != null)
-                    {
-                        EditorUtility.SetSelectedRenderState(meshRenderer, EditorSelectedRenderState.Hidden);
-                    }
+                    EditorUtility.SetSelectedRenderState(meshRenderer, EditorSelectedRenderState.Hidden);
                 }
             }
         }

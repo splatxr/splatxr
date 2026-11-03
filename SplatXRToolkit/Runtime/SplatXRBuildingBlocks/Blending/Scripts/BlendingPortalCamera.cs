@@ -13,6 +13,7 @@ namespace SplatXR
         private RenderTexture camouflageTexture;
         private MaterialLibrary materialLibrary;
         private Camera centerEyeAnchorCamera;
+        private Camera portalCamera;
 
         private float halfIPD = 0.03f;
 
@@ -35,6 +36,7 @@ namespace SplatXR
                 return;
             }
 
+            portalCamera = GetComponent<Camera>();
             setEyePosition();
 
             camouflageTexture = makeRenderTexture();
@@ -55,13 +57,13 @@ namespace SplatXR
 
             if (!XRSettings.enabled)
             {
-                GetComponent<Camera>().projectionMatrix = centerEyeAnchorCamera.projectionMatrix;
+                portalCamera.projectionMatrix = centerEyeAnchorCamera.projectionMatrix;
             }
             else if (TryGetEyeProjection(out Matrix4x4 projection))
             {
-                GetComponent<Camera>().projectionMatrix = projection;
+                portalCamera.projectionMatrix = projection;
             }
-            GetComponent<Camera>().targetTexture = camouflageTexture;
+            portalCamera.targetTexture = camouflageTexture;
         }
 
         private RenderTexture makeRenderTexture()
@@ -69,9 +71,10 @@ namespace SplatXR
             RenderTexture renderTexture;
             if (XRSettings.enabled)
             {
-                var d = XRSettings.eyeTextureDesc;
-          
-                renderTexture = new RenderTexture(1680, 1760, 24); 
+                // Match the headset's per-eye resolution; fall back to Quest 3's if the XR display isn't running yet.
+                int width = XRSettings.eyeTextureWidth > 0 ? XRSettings.eyeTextureWidth : 1680;
+                int height = XRSettings.eyeTextureHeight > 0 ? XRSettings.eyeTextureHeight : 1760;
+                renderTexture = new RenderTexture(width, height, 24);
             }
             else
             {
@@ -91,10 +94,10 @@ namespace SplatXR
 
         if (XRSettings.enabled && TryGetEyeProjection(out Matrix4x4 projection))
         {
-            GetComponent<Camera>().projectionMatrix = projection;
+            portalCamera.projectionMatrix = projection;
         }
 
-        GetComponent<Camera>().aspect = (float)camouflageTexture.width / (float)camouflageTexture.height;
+        portalCamera.aspect = (float)camouflageTexture.width / (float)camouflageTexture.height;
 
     }
 
@@ -147,7 +150,6 @@ namespace SplatXR
         {
             if (camouflageTexture == null) return;
 
-            Camera portalCamera = GetComponent<Camera>();
             if (portalCamera != null && portalCamera.targetTexture == camouflageTexture)
             {
                 portalCamera.targetTexture = null;
